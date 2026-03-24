@@ -12,6 +12,8 @@
 | `benchmark_training_e2e.py` | **端到端**测试：磁盘 I/O → DataLoader → CPU→GPU → 计算 → 更新参数 |
 | `benchmark_gpu_utilization.py` | 监控训练过程中每张 GPU 的 SM 利用率并绘图 |
 | `benchmark_nuplan_sim.py` | 模拟 nuplan CPU 预处理管线，评估数据处理瓶颈 |
+| `benchmark_feature_cache.py` | 模拟 nuplan feature cache (gzip pickle) 训练性能 |
+| `benchmark_augmentation.py` | **真实瓶颈分析**：完整 ContrastiveScenarioGenerator 增强管线 |
 
 ## 测试原理
 
@@ -520,6 +522,172 @@ torchrun --nproc_per_node=8 benchmark_training_ddp.py --batch-size 32
    | 无 nuplan 数据 | 使用 `benchmark_generate_data.py` 生成模拟数据 + `benchmark_training_e2e.py` |
    | 评估 CPU 开销 | `benchmark_nuplan_sim.py --num-workers N` 调整 worker 数量 |
 
+### 九、Feature Cache 训练性能
+
+Pluto 推荐使用 `py_func=cache` 预计算特征并存为 gzip pickle 文件，训练时通过 `cache.use_cache_without_dataset=true` 直接读取。使用 `benchmark_feature_cache.py` 模拟该流程。
+
+#### 缓存格式
+
+| 属性 | 值 |
+|------|-----|
+| 格式 | gzip-compressed pickle (compresslevel=1) |
+| 文件大小/sample | ~0.60 MB (.gz) |
+| 未压缩大小/sample | ~0.64 MB |
+| 压缩率 | 1.1x |
+| 内容 | `{"data": {numpy arrays dict}}` |
+
+#### 缓存读取耗时分解（per-sample）
+
+| 操作 | 耗时 | 占比 |
+|------|:----:|:---:|
+| gzip 解压 + pickle.load | 3.2 ms | 93% |
+| numpy → torch 转换 | 0.2 ms | 7% |
+| **合计** | **3.5 ms** | 100% |
+
+> 对比：torch.load (.pt 文件) 仅需 0.8 ms/sample，缓存格式慢约 **4.5x**（gzip 解压开销）
+
+#### Worker 理论吞吐
+
+| Workers/GPU | 理论吞吐 (3.5ms/sample) |
+|:-----------:|:----------------------:|
+| 4 | 1157 samples/sec |
+| 8 | 2314 samples/sec |
+| 16 | 4629 samples/sec |
+
+#### 8 卡 DDP 训练耗时（Feature Cache）
+
+| 配置 | 总步耗时 | DataLoader | CPU→GPU | Forward | Backward | Optimizer | 全局吞吐量 | DL 占比 |
+|:----:|:-------:|:----------:|:-------:|:-------:|:--------:|:---------:|:---------:|:-------:|
+| bs=32, 4w | 146.5 ms | 4.2 ms | — | 53.0 ms | 77.5 ms | 10.5 ms | 1748 samples/s | 2.9% |
+| bs=32, 8w | 145.1 ms | 8.4 ms | 1.3 ms | 51.5 ms | 75.3 ms | 8.5 ms | 1765 samples/s | 5.8% |
+| bs=32, 16w | 144.3 ms | 11.7 ms | — | 51.6 ms | 71.9 ms | 7.9 ms | 1774 samples/s | 8.1% |
+| bs=96, 8w | 319.7 ms | 38.9 ms | 3.7 ms | 100.2 ms | 169.8 ms | 7.2 ms | 2402 samples/s | 12.2% |
+| bs=32, 8w, **+augment** | 205.7 ms | 7.5 ms | 2.2 ms | 74.5 ms | 111.5 ms | 10.0 ms | 1245 samples/s | 3.7% |
+
+> 表中步耗时为 mean 值。"+augment" 表示启用 Contrastive 数据增强（正样本对，batch 翻倍）。
+
+#### Feature Cache 性能分析
+
+1. **缓存读取不是瓶颈**
+   - bs=32 时 DataLoader 占 3~8%（与纯 .pt 的 3.6% 基本持平）
+   - bs=96 时 DataLoader 占 12%，轻微开销但不是主要瓶颈
+   - 4 workers 即可满足 bs=32，因为 3.5ms/sample × 32 / 4 = 28ms << GPU 计算 135ms
+
+2. **对比各数据管线**（8 卡 DDP, bs=32, 8 workers）
+
+   | 数据管线 | 总步耗时 | DL 耗时 | DL 占比 | 全局吞吐量 | 相对性能 |
+   |---------|:-------:|:------:|:------:|:---------:|:-------:|
+   | **Feature Cache (.gz)** | **145 ms** | **8.4 ms** | **5.8%** | **1765 samples/s** | **100%** |
+   | 纯 .pt 文件 | 146 ms | 5.3 ms | 3.6% | 1755 samples/s | 99% |
+   | CPU 模拟预处理 (8w) | 309 ms | 119 ms | 38.5% | 830 samples/s | 47% |
+   | CPU 模拟预处理 (16w) | 281 ms | 79 ms | 28.0% | 911 samples/s | 52% |
+
+3. **Feature Cache 与 .pt 性能几乎相同**
+   - 虽然单 sample gzip 解压比 torch.load 慢 4.5x（3.5ms vs 0.8ms）
+   - 但多 worker 预取完全掩盖了这个差异
+   - 最终训练吞吐量只差 < 1%
+
+4. **Data Augmentation 的影响**
+   - 启用 Contrastive Augmentation 后 batch 翻倍（anchor + positive）
+   - Forward + Backward 耗时增加 ~50%（处理 2x 数据量）
+   - DataLoader 开销不变（augmentation 在 worker 进程内完成）
+   - 全局吞吐量下降 ~30%（1765 → 1245 samples/s），但每有效样本的吞吐实际相似
+
+5. **推荐配置**
+
+   | 目标 | 推荐 |
+   |------|------|
+   | 最大训练吞吐 | Feature cache + bs=96 + 8 workers → **2402 samples/s** |
+   | 平衡吞吐/显存 | Feature cache + bs=32 + 4 workers → **1748 samples/s** |
+   | 含 Contrastive | Feature cache + bs=32 + 8 workers + augment → **1245 samples/s** |
+
+6. **实际训练预估（Feature Cache, bs=32, 8 卡）**
+   - nuplan 数据集约 100 万场景
+   - Feature cache 总存储：100 万 × 0.6 MB = **~600 GB**
+   - 全局 256 samples/step → 约 3906 steps/epoch
+   - 1765 samples/s → 每个 epoch 约 **9.4 分钟**
+   - 训练 25 个 epoch 约 **3.9 小时**
+
+### 十、真实瓶颈：ContrastiveScenarioGenerator 数据增强
+
+**即使使用了 feature cache，真实 Pluto 训练仍然很慢——原因不在缓存读取，而在数据增强。**
+
+Pluto 训练配置（`train_pluto.yaml`）**始终启用** `ContrastiveScenarioGenerator`，在每个 `__getitem__` 调用中执行大量 CPU 密集操作。使用 `benchmark_augmentation.py` 精确复现了这一管线。
+
+#### 每个 sample 的完整 CPU 处理流程
+
+```
+cache.gz → gzip+pickle.load                       [6.6 ms]
+  → deepcopy(data) for positive sample             [0.2 ms]
+    → collision_check loop (up to 5x, np→torch)    [0.8 ms]
+    → cv2.warpAffine 2x on 600×600 cost map        [3.4 ms]  ← 主要开销!
+    → crop_img_from_center (600→500)                [1.0 ms]
+    → PlutoFeature.normalize (np.matmul)            [0.5 ms]
+  → deepcopy(data) for negative sample             [0.2 ms]
+    → neg_agent_dropout / insertion                 [0.04 ms]
+  → to_feature_tensor ×3 (numpy→torch)             [0.9 ms]
+                                           合计: ~13.6 ms/sample
+```
+
+#### 每个操作的占比
+
+| 操作 | 耗时 | 占比 | 说明 |
+|------|:----:|:---:|------|
+| gzip + pickle.load | 6.6 ms | 49% | 缓存读取，不可避免 |
+| cv2.warpAffine ×2 | 3.4 ms | 25% | **最大 CPU 开销**：600×600 图像平移+旋转 |
+| crop (×2) | 1.0 ms | 7% | 600→500 裁剪 + dtype 转换 |
+| collision_check (×5) | 0.8 ms | 6% | numpy→torch + SAT 碰撞检测循环 |
+| to_tensor ×3 | 0.9 ms | 6% | 递归 numpy→torch 转换（3 份数据） |
+| normalize (np.matmul) | 0.5 ms | 4% | 坐标旋转变换（agent + map + ref_line） |
+| deepcopy ×2 | 0.4 ms | 3% | 正/负样本的深拷贝 |
+
+#### DataLoader 吞吐量估算
+
+| Workers/GPU | 理论吞吐 (13.6ms/sample) |
+|:-----------:|:-----------------------:|
+| 4 | 294 samples/sec |
+| 8 | 588 samples/sec |
+| 16 | 1176 samples/sec |
+
+#### 8 卡 DDP 训练对比：有 vs 无增强
+
+| 配置 | 总步耗时 (median) | DataLoader | Forward | Backward | 全局吞吐量 | GPU 显存 |
+|:----:|:----------------:|:----------:|:-------:|:--------:|:---------:|:--------:|
+| **无增强** | 128 ms | 0.1 ms | 48 ms | 68 ms | **1542 samples/s** | 1.50 GB |
+| **有增强 (3x batch)** | 276 ms | 0.2 ms | 110 ms | 149 ms | **279 samples/s** | 4.30 GB |
+
+> 关键发现：
+> - 有增强时 **effective batch = 3×32 = 96**（anchor + positive + negative），GPU 计算量增加 ~3 倍
+> - Forward 从 48ms → 110ms（2.3x），Backward 从 68ms → 149ms（2.2x）
+> - GPU 显存从 1.50 GB → 4.30 GB（2.9x）
+> - 吞吐量下降 **5.5 倍**（1542 → 279 samples/s unique samples）
+
+#### 为什么 cache 没有显著加速
+
+1. **缓存只加速了 feature extraction，但增强在 cache 之后执行**
+   - 缓存读取 6.6ms 仅占 __getitem__ 总耗时的 49%
+   - 剩下 7.0ms 是增强开销（deepcopy + warpAffine + normalize + collision + to_tensor）
+
+2. **3x batch 放大效应**
+   - ContrastiveScenarioGenerator 将每个 sample 扩展为 3 个（anchor + positive + negative）
+   - GPU 实际处理 3×bs 的数据，Forward + Backward 耗时接近 3 倍
+   - H2D 传输也增加 3 倍（3.1ms → 10ms）
+
+3. **pad_sequence 开销**
+   - 增强后不同 sample 的 agent 数量不同（dropout 导致）
+   - 3×B 个 sample 做 pad_sequence 的开销高于 B 个固定大小的 sample
+
+#### 优化建议
+
+| 优化方向 | 预期收益 | 实现复杂度 |
+|---------|:-------:|:---------:|
+| **减小 cost map 分辨率**（600→300） | warpAffine 快 4x，节省 ~2.5ms/sample | 低 |
+| **GPU 上做 warpAffine**（用 `kornia` 或 `grid_sample`） | warpAffine+crop 共省 ~3.5ms/sample | 中 |
+| **预计算增强后的 cache**（离线增强） | 省 ~7ms/sample，但存储增 3x | 中 |
+| **增加 DataLoader workers**（8→16） | DataLoader 瓶颈时有效 | 低 |
+| **去掉 gzip 压缩**（用 pickle 或 torch.save） | 读取快 ~3x，但存储增 | 低 |
+| **减少 deepcopy**（只复制需要修改的字段） | 省 ~0.4ms/sample | 低 |
+
 ---
 
 ## 已知限制
@@ -559,6 +727,26 @@ for w in 0 2 4 8; do
   torchrun --nproc_per_node=8 benchmark_training_e2e.py \
     --data-dir /tmp/pluto_bench_data --batch-size 32 --num-workers $w
 done
+```
+
+### Feature Cache 训练测试
+
+```bash
+# 1. 生成模拟 feature cache（gzip pickle 格式，与 nuplan 一致）
+python benchmark_feature_cache.py --mode generate --num-samples 10000 \
+  --cache-dir /tmp/pluto_feature_cache
+
+# 2. 8 卡 DDP 训练
+torchrun --nproc_per_node=8 benchmark_feature_cache.py --mode benchmark \
+  --cache-dir /tmp/pluto_feature_cache --batch-size 32 --num-workers 8
+
+# 3. 含数据增强
+torchrun --nproc_per_node=8 benchmark_feature_cache.py --mode benchmark \
+  --cache-dir /tmp/pluto_feature_cache --batch-size 32 --augment
+
+# 4. 仅测 IO 性能
+python benchmark_feature_cache.py --mode io --cache-dir /tmp/pluto_feature_cache \
+  --pt-dir /tmp/pluto_bench_data_20k
 ```
 
 ### 模拟 nuplan CPU 预处理瓶颈

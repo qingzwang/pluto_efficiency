@@ -688,15 +688,54 @@ Pluto 训练配置（`train_pluto.yaml`）**始终启用** `ContrastiveScenarioG
 | 无增强，最大吞吐 | 64+ | ~2170+ samples/s | 见第三节 DDP 测试，bs=96 峰值 ~3000 samples/s |
 | 无增强，保守 | 32 | ~1580 samples/s | 显存 1.5 GB |
 
-#### CPU 增强优化建议
+#### 增强模式下 Backward 方差极大的根因分析
+
+增强模式下 Backward 方差高达 **21x**（min 208ms, max 4398ms），而纯 GPU 同 batch size 方差仅 1.2x。使用 `diag_backward_variance.py` 进行了 5 组对照实验（8 × L40S DDP, 50 步 + 10 步 warmup）：
+
+| 测试 | 描述 | Step median | Bwd max/min | Step max/min |
+|:---:|------|:---:|:---:|:---:|
+| 1 | 纯 GPU bs=96，同一 tensor 重用 | 261 ms | **1.2x** | 1.1x |
+| 5 | 纯 GPU bs=96，每步新分配 tensor | 274 ms | **1.1x** | 1.0x |
+| 2 | DataLoader bs=32 无增强 | 143 ms | **1.3x** | 1.2x |
+| 4 | DataLoader bs=32 有增强 + `gc.disable()` | **517 ms** | **24.9x** | 10.9x |
+| 3 | DataLoader bs=32 有增强（默认） | **803 ms** | **21.2x** | 11.6x |
+
+**排除的假设**：
+
+- **CUDA 内存分配器**：Test 5 每步对 bs=96 全新分配 tensor，方差仅 1.0x → **不是分配器的问题**
+- **Python GC 导致极端 spike**：Test 4 关闭 GC 后极端 spike 仍在（bwd max 4020ms）→ **GC 不是 spike 原因**
+
+**确认的两个叠加因素**：
+
+1. **Python GC 拖慢 median（~1.55x 开销）**
+
+   对比 Test 3 vs Test 4（开 gc vs 关 gc），median 变化：
+
+   | Phase | 默认 (gc on) | gc.disable() | 加速比 |
+   |:-----:|:-----------:|:------------:|:------:|
+   | Forward | 231 ms | 165 ms | 1.40x |
+   | Backward | 427 ms | 310 ms | 1.38x |
+   | **Total step** | **803 ms** | **517 ms** | **1.55x** |
+
+   增强模式下每步有 3×32=96 份大 dict（含 numpy array + torch tensor）被创建并销毁。Python 的循环引用 GC 周期性扫描这些大量临时对象，开销显著。
+
+2. **变长 pad_sequence 导致 CUDA tensor shape 每步变化 → 极端 spike**
+
+   增强模式下 positive sample 做 agent dropout（50% 概率移除非交互 agent），导致 96 个 sample 的 agent 维度不一致。`pad_sequence` 每步 padding 到不同的 max length。当 tensor shape 变化时，PyTorch CUDA caching allocator 无法重用之前 cache 的 memory block，需要 split/merge/compact，偶发触发大规模内存整理（表现为单步 4000ms+ spike）。
+
+   对照证据：Test 5 同样是 bs=96 且每步新分配，但 shape 固定（20 agents），方差仅 1.0x。
+
+**优化建议**：
 
 | 优化方向 | 预期收益 | 实现复杂度 |
 |---------|:-------:|:---------:|
+| **训练循环中 `gc.disable()`**（周期性手动 `gc.collect()`） | median 快 **1.55x**，立竿见影 | 低 |
+| **固定 pad 长度**（不用 `pad_sequence`，统一 pad 到 max_agents） | 消除极端 spike，方差降到 ~1.2x | 低 |
+| **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** | 减少 allocator 碎片化 | 低 |
 | **减小 cost map 分辨率**（600→300） | warpAffine 快 4x，节省 ~2.5ms/sample | 低 |
 | **GPU 上做 warpAffine**（用 `kornia` 或 `grid_sample`） | warpAffine+crop 共省 ~3.5ms/sample | 中 |
-| **预计算增强后的 cache**（离线增强） | 省 ~7ms/sample，但存储增 3x | 中 |
+| **预计算增强后的 cache**（离线增强） | 省 ~7ms/sample CPU，但存储增 3x | 中 |
 | **去掉 gzip 压缩**（用 pickle 或 torch.save） | 读取快 ~3x，但存储增 | 低 |
-| **减少 deepcopy**（只复制需要修改的字段） | 省 ~0.4ms/sample | 低 |
 
 ---
 

@@ -6,8 +6,10 @@
 
 | 脚本 | 用途 |
 |------|------|
-| `benchmark_training.py` | 单卡测试，支持不同 batch size / 模型配置 |
-| `benchmark_training_ddp.py` | 多卡 DDP 测试，支持 1~8 卡线性扩展性分析 |
+| `benchmark_training.py` | 单卡纯 GPU 测试，支持不同 batch size / 模型配置 |
+| `benchmark_training_ddp.py` | 多卡 DDP 纯 GPU 测试，支持 1~8 卡扩展性分析 |
+| `benchmark_generate_data.py` | 生成模拟 `.pt` 数据文件到磁盘 |
+| `benchmark_training_e2e.py` | **端到端**测试：磁盘 I/O → DataLoader → CPU→GPU → 计算 → 更新参数 |
 
 ## 测试原理
 
@@ -318,6 +320,74 @@ torchrun --nproc_per_node=8 benchmark_training_ddp.py --batch-size 32
    - 但对于 4M 参数的小模型，即使 8 卡仍有近 89% 效率
    - 更大的模型（计算/通信比更高）扩展效率会更好
 
+### 五、端到端训练（磁盘 I/O → CPU → GPU → 计算）
+
+使用 `benchmark_training_e2e.py` 测试完整训练管线，模拟数据预存为 `.pt` 文件（每个 0.45 MB），通过 PyTorch DataLoader 从磁盘读取。
+
+#### 测试流程
+
+```
+磁盘 (.pt 文件)
+  → DataLoader (多进程读取 + 反序列化)    [DataLoader]
+    → CPU Tensor 搬运到 GPU              [CPU→GPU (H2D)]
+      → 模型前向 + 损失计算               [Forward+Loss]
+        → 反向传播 + DDP 梯度同步         [Backward]
+          → 优化器更新 + 梯度清零          [Optimizer]
+```
+
+#### 单卡 vs 8 卡 DDP（per-GPU bs=32, 4 workers）
+
+| 指标 | 单卡 | 8 卡 DDP |
+|------|:----:|:--------:|
+| 全局 batch | 32 | 256 |
+| **总步耗时** | **115.5 ms** | **135.3 ms** |
+| DataLoader | 0.2 ms (0.9%) | 0.3 ms (1.3%) |
+| CPU→GPU | 1.1 ms (1.0%) | 1.1 ms (0.8%) |
+| Forward+Loss | 52.6 ms (44.8%) | 57.3 ms (41.2%) |
+| Backward | 54.8 ms (47.3%) | 67.4 ms (50.5%) |
+| Optimizer | 6.9 ms (6.0%) | 8.4 ms (6.2%) |
+| **全局吞吐量** | **275.2 samples/s** | **1858.0 samples/s** |
+
+#### 8 卡 DDP 不同 DataLoader workers 数
+
+| Workers/GPU | 总步耗时 | DataLoader | CPU→GPU | Forward | Backward | Optimizer | 全局吞吐量 |
+|:-----------:|:-------:|:----------:|:-------:|:-------:|:--------:|:---------:|:---------:|
+| 0 (主进程) | 157.2 ms | 30.5 ms (19.4%) | 1.2 ms | 51.0 ms | 65.3 ms | 9.1 ms | 1618.2 samples/s |
+| 2 | 135.0 ms | 0.3 ms (1.0%) | 1.1 ms | 54.9 ms | 69.7 ms | 7.4 ms | 1881.3 samples/s |
+| 4 | 135.3 ms | 0.2 ms (1.6%) | 1.1 ms | 55.2 ms | 67.4 ms | 8.4 ms | 1815.9 samples/s |
+| 8 | 134.4 ms | 0.3 ms (1.1%) | 1.1 ms | 55.7 ms | 68.8 ms | 7.6 ms | 1849.1 samples/s |
+
+> 表中步耗时、各阶段均为 median 值，更稳定。
+
+#### 8 卡 DDP 不同 Batch Size（4 workers）
+
+| Per-GPU BS | 全局 BS | 总步耗时 | DataLoader | CPU→GPU | Forward | Backward | Optimizer | 全局吞吐量 |
+|:----------:|:-------:|:-------:|:----------:|:-------:|:-------:|:--------:|:---------:|:---------:|
+| 16 | 128 | 108.4 ms | 0.3 ms (1.5%) | 0.7 ms | 47.1 ms | 51.6 ms | 8.6 ms | 1161.0 samples/s |
+| 32 | 256 | 135.3 ms | 0.3 ms (1.3%) | 1.1 ms | 57.3 ms | 67.4 ms | 8.4 ms | 1858.0 samples/s |
+| 64 | 512 | 194.3 ms | 0.3 ms (2.6%) | 2.2 ms | 74.7 ms | 109.8 ms | 7.8 ms | 2548.3 samples/s |
+| 96 | 768 | 278.2 ms | 0.3 ms (3.0%) | 3.2 ms | 98.1 ms | 170.6 ms | 7.4 ms | 2694.7 samples/s |
+
+#### 端到端测试结论
+
+1. **数据加载不是瓶颈（workers ≥ 2 时）**
+   - 0 workers（主进程加载）：DataLoader 占 19.4%（30.5 ms），严重拖慢训练
+   - 2+ workers：DataLoader 降至 0.2~0.3 ms（< 2%），完全被预取覆盖
+   - 2 和 4/8 workers 差异极小，**推荐 2~4 workers/GPU**
+
+2. **CPU→GPU 传输开销很小**
+   - bs=32 时仅 1.1 ms（< 1%），pin_memory=True 发挥作用
+   - bs=96 时 3.2 ms，随 batch 线性增长但仍不是瓶颈
+
+3. **计算仍是绝对主导**
+   - Forward + Backward 占总耗时 **90%+**，与纯 GPU benchmark 一致
+   - 说明当前模型规模下，数据管线不会成为训练瓶颈
+
+4. **端到端 vs 纯 GPU 对比**（8 卡 DDP, bs=32）
+   - 纯 GPU（模拟数据）：123.5 ms/step, 2072 samples/s
+   - 端到端（磁盘读取）：135.3 ms/step, 1858 samples/s
+   - 端到端额外开销 **约 12 ms（9.6%）**，主要来自 DataLoader 偶发延迟和 H2D 传输
+
 ---
 
 ## 已知限制
@@ -338,6 +408,26 @@ torchrun --nproc_per_node=8 benchmark_training_ddp.py --batch-size 32
 ---
 
 ## 如何扩展
+
+### 端到端训练测试
+
+```bash
+# 1. 生成模拟数据到磁盘
+python benchmark_generate_data.py --num-samples 20000 --output-dir /tmp/pluto_bench_data
+
+# 2. 单卡端到端
+python benchmark_training_e2e.py --data-dir /tmp/pluto_bench_data --batch-size 32 --num-workers 4
+
+# 3. 8 卡 DDP 端到端
+torchrun --nproc_per_node=8 benchmark_training_e2e.py \
+  --data-dir /tmp/pluto_bench_data --batch-size 32 --num-workers 4
+
+# 4. 对比不同 DataLoader workers
+for w in 0 2 4 8; do
+  torchrun --nproc_per_node=8 benchmark_training_e2e.py \
+    --data-dir /tmp/pluto_bench_data --batch-size 32 --num-workers $w
+done
+```
 
 ### 对比不同模型规模
 

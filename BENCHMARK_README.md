@@ -651,31 +651,45 @@ cache.gz → gzip+pickle.load                       [6.6 ms]
 
 #### 8 卡 DDP 训练对比：有 vs 无增强
 
-| 配置 | 总步耗时 (median) | DataLoader | Forward | Backward | 全局吞吐量 | GPU 显存 |
-|:----:|:----------------:|:----------:|:-------:|:--------:|:---------:|:--------:|
-| **无增强** | 128 ms | 0.1 ms | 48 ms | 68 ms | **1542 samples/s** | 1.50 GB |
-| **有增强 (3x batch)** | 276 ms | 0.2 ms | 110 ms | 149 ms | **279 samples/s** | 4.30 GB |
+| 配置 | 实际 GPU batch | 总步耗时 (median) | DataLoader 等待 | Forward | Backward | 全局吞吐量 | GPU 显存 |
+|:----:|:-------------:|:----------------:|:--------------:|:-------:|:--------:|:---------:|:--------:|
+| **无增强** | 32 | 128 ms | 0.1 ms | 48 ms | 68 ms | **1542 samples/s** | 1.50 GB |
+| **有增强** | **3×32 = 96** | 276 ms | 0.2 ms | 110 ms | 149 ms | **279 samples/s** | 4.30 GB |
+
+> **注意**：DataLoader 列显示的是主进程**等待下一个 batch 的时间**，不是 CPU 处理时间。实际的增强 CPU 开销（~13.6ms/sample）发生在 8 个 worker 进程内部，与 GPU 计算并行执行。8 workers 每步可并行处理 32 samples 仅需 ~54ms，远小于 GPU 步耗时 276ms，因此 workers 始终提前准备好数据，等待时间 ≈ 0。
+>
+> **但如果 workers 不足或 GPU 更快**（比如更大模型、更少 workers），增强的 CPU 开销就会暴露为 DataLoader 瓶颈。
 
 > 关键发现：
-> - 有增强时 **effective batch = 3×32 = 96**（anchor + positive + negative），GPU 计算量增加 ~3 倍
-> - Forward 从 48ms → 110ms（2.3x），Backward 从 68ms → 149ms（2.2x）
-> - GPU 显存从 1.50 GB → 4.30 GB（2.9x）
-> - 吞吐量下降 **5.5 倍**（1542 → 279 samples/s unique samples）
+>
+> 1. **3x batch 是最大减速因素**：ContrastiveScenarioGenerator 在 collate 时将 anchor + positive + negative 拼成 3×B 的 batch 送入 GPU
+>    - Forward 从 48ms → 110ms（2.3x，因为 GPU batch 从 32 → 96）
+>    - Backward 从 68ms → 149ms（2.2x）
+>    - GPU 显存从 1.50 GB → 4.30 GB（2.9x）
+>    - 对比第五节端到端 bs=96 的 Forward=98ms，增强的 110ms 基本一致（多出 12ms 是 pad_sequence 对齐变长序列的开销）
+>
+> 2. **CPU 增强开销被 worker 并行掩盖**：13.6ms/sample 的 CPU 开销在 8 workers 下不构成瓶颈，但会限制 worker 数量不足时的性能
+>
+> 3. **综合减速 5.5 倍**（1542 → 279 samples/s unique samples）
 
 #### 为什么 cache 没有显著加速
 
-1. **缓存只加速了 feature extraction，但增强在 cache 之后执行**
-   - 缓存读取 6.6ms 仅占 __getitem__ 总耗时的 49%
-   - 剩下 7.0ms 是增强开销（deepcopy + warpAffine + normalize + collision + to_tensor）
+慢的原因 **不在 CPU DataLoader**（8 workers 能跟上），**而在 GPU 要处理 3 倍的数据量**：
 
-2. **3x batch 放大效应**
-   - ContrastiveScenarioGenerator 将每个 sample 扩展为 3 个（anchor + positive + negative）
-   - GPU 实际处理 3×bs 的数据，Forward + Backward 耗时接近 3 倍
+1. **3x batch 是主因（占减速的 ~80%）**
+   - ContrastiveScenarioGenerator 在 collate 时将 anchor + positive + negative 拼成 3×B 的 batch
+   - GPU 实际处理 bs=96 而非 bs=32：Forward 48→110ms，Backward 68→149ms
+   - 对比无增强 bs=96 的结果（Forward=98ms, Backward=171ms），增强的开销基本就是 3x batch 的代价
    - H2D 传输也增加 3 倍（3.1ms → 10ms）
 
-3. **pad_sequence 开销**
-   - 增强后不同 sample 的 agent 数量不同（dropout 导致）
-   - 3×B 个 sample 做 pad_sequence 的开销高于 B 个固定大小的 sample
+2. **CPU 增强开销（次要因素）**
+   - 缓存读取 6.6ms + 增强 7.0ms = 13.6ms/sample
+   - 但 8 workers 并行处理，每步 32 samples 只需 ~54ms，GPU 步耗时 276ms >> 54ms
+   - **当前配置下 CPU 不是瓶颈**，但 workers < 4 或 GPU 更快时会成为瓶颈
+
+3. **pad_sequence 对齐开销**
+   - 增强后不同 sample 的 agent 数量不同（dropout 导致变长序列）
+   - 3×B 个变长 sample 做 pad_sequence 比 B 个固定大小 sample 更慢
 
 #### 优化建议
 

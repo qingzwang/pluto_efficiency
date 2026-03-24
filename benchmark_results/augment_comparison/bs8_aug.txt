@@ -1,0 +1,141 @@
+WARNING:torch.distributed.run:
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+/opt/conda/envs/pluto/lib/python3.9/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/opt/conda/envs/pluto/lib/python3.9/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/opt/conda/envs/pluto/lib/python3.9/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/opt/conda/envs/pluto/lib/python3.9/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/opt/conda/envs/pluto/lib/python3.9/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/opt/conda/envs/pluto/lib/python3.9/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/opt/conda/envs/pluto/lib/python3.9/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/opt/conda/envs/pluto/lib/python3.9/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+======================================================================
+AUGMENTATION PIPELINE PROFILING (per-sample)
+======================================================================
+
+  Results (50 samples):
+  Step                          mean   median     std  %total
+  --------------------------------------------------------
+  cache_read                   6.79ms    6.64ms   0.45ms   49.4%
+  deepcopy_pos                 0.16ms    0.13ms   0.06ms    1.1%
+  collision_check              0.86ms    0.70ms   0.72ms    6.2%
+  warp_affine                  3.58ms    3.01ms   1.93ms   26.1%
+  crop                         0.86ms    0.67ms   0.38ms    6.3%
+  normalize_pos                0.46ms    0.38ms   0.18ms    3.3%
+  deepcopy_neg                 0.15ms    0.13ms   0.05ms    1.1%
+  neg_generator                0.03ms    0.03ms   0.02ms    0.2%
+  to_tensor_x3                 0.85ms    0.83ms   0.36ms    6.2%
+  total                       13.75ms   13.13ms   3.47ms  100.0%
+
+  Total per-sample CPU cost: 13.7ms
+  Effective single-worker throughput: 73 samples/sec
+
+  DataLoader throughput estimates (per-sample=13.7ms):
+     1 workers:      73 samples/sec
+     2 workers:     145 samples/sec
+     4 workers:     291 samples/sec
+     8 workers:     582 samples/sec
+    16 workers:    1164 samples/sec
+
+  For comparison, cache-read-only time: 6.8ms
+  Augmentation overhead: 7.0ms (51% of total)
+
+  --- Impact on Training ---
+    bs=16 workers= 4: supply=291 samp/s, GPU demand=229 samp/s → GPU bound
+    bs=16 workers= 8: supply=582 samp/s, GPU demand=229 samp/s → GPU bound
+    bs=16 workers=16: supply=1164 samp/s, GPU demand=229 samp/s → GPU bound
+    bs=32 workers= 4: supply=291 samp/s, GPU demand=229 samp/s → GPU bound
+    bs=32 workers= 8: supply=582 samp/s, GPU demand=229 samp/s → GPU bound
+    bs=32 workers=16: supply=1164 samp/s, GPU demand=229 samp/s → GPU bound
+
+======================================================================
+TRAINING BENCHMARK (WITH AUGMENTATION)
+======================================================================
+Mode:              DDP (8 GPUs)
+GPU:               NVIDIA L40S
+Batch per GPU:     8
+Effective batch:   64 (×3 = 192 with augmentation)
+Workers per GPU:   8
+Augmentation:      True
+Cache dir:         /tmp/pluto_augment_cache_20k
+Dataset size:      20000 samples
+Steps per epoch:   312
+Parameters:        4.06M
+----------------------------------------------------------------------
+Warming up ...
+/opt/conda/envs/pluto/lib/python3.9/site-packages/torch/nn/functional.py:4236: UserWarning: Default grid_sample and affine_grid behavior has changed to align_corners=False since 1.3.0. Please specify align_corners=True if the old behavior is desired. See the documentation of grid_sample for details.
+  warnings.warn(
+/opt/conda/envs/pluto/lib/python3.9/site-packages/torch/nn/functional.py:4236: UserWarning: Default grid_sample and affine_grid behavior has changed to align_corners=False since 1.3.0. Please specify align_corners=True if the old behavior is desired. See the documentation of grid_sample for details.
+  warnings.warn(
+/opt/conda/envs/pluto/lib/python3.9/site-packages/torch/nn/functional.py:4236: UserWarning: Default grid_sample and affine_grid behavior has changed to align_corners=False since 1.3.0. Please specify align_corners=True if the old behavior is desired. See the documentation of grid_sample for details.
+  warnings.warn(
+/opt/conda/envs/pluto/lib/python3.9/site-packages/torch/nn/functional.py:4236: UserWarning: Default grid_sample and affine_grid behavior has changed to align_corners=False since 1.3.0. Please specify align_corners=True if the old behavior is desired. See the documentation of grid_sample for details.
+  warnings.warn(
+/opt/conda/envs/pluto/lib/python3.9/site-packages/torch/nn/functional.py:4236: UserWarning: Default grid_sample and affine_grid behavior has changed to align_corners=False since 1.3.0. Please specify align_corners=True if the old behavior is desired. See the documentation of grid_sample for details.
+  warnings.warn(
+/opt/conda/envs/pluto/lib/python3.9/site-packages/torch/nn/functional.py:4236: UserWarning: Default grid_sample and affine_grid behavior has changed to align_corners=False since 1.3.0. Please specify align_corners=True if the old behavior is desired. See the documentation of grid_sample for details.
+  warnings.warn(
+/opt/conda/envs/pluto/lib/python3.9/site-packages/torch/nn/functional.py:4236: UserWarning: Default grid_sample and affine_grid behavior has changed to align_corners=False since 1.3.0. Please specify align_corners=True if the old behavior is desired. See the documentation of grid_sample for details.
+  warnings.warn(
+/opt/conda/envs/pluto/lib/python3.9/site-packages/torch/nn/functional.py:4236: UserWarning: Default grid_sample and affine_grid behavior has changed to align_corners=False since 1.3.0. Please specify align_corners=True if the old behavior is desired. See the documentation of grid_sample for details.
+  warnings.warn(
+  Epoch 0 Step    1 | loss=11.6137 | total=2556.6ms (dl=1153.7 h2d=2.5 fwd=195.3 bwd=1173.5 opt=31.6ms)
+  Epoch 0 Step   10 | loss=10.9671 | total=185.6ms (dl=0.2 h2d=2.4 fwd=75.0 bwd=98.3 opt=9.6ms)
+  Epoch 0 Step   20 | loss=10.9477 | total=177.3ms (dl=1.4 h2d=2.7 fwd=57.9 bwd=105.7 opt=9.6ms)
+  Epoch 0 Step   30 | loss=10.8187 | total=166.6ms (dl=0.6 h2d=2.6 fwd=71.7 bwd=78.0 opt=13.7ms)
+  Epoch 0 Step   40 | loss=10.7871 | total=448.8ms (dl=0.4 h2d=2.5 fwd=83.0 bwd=109.6 opt=253.4ms)
+  Epoch 0 Step   50 | loss=10.6788 | total=186.5ms (dl=0.9 h2d=3.4 fwd=56.1 bwd=116.2 opt=9.8ms)
+  Epoch 0 Step   60 | loss=10.3833 | total=179.0ms (dl=0.6 h2d=2.5 fwd=63.1 bwd=101.3 opt=11.5ms)
+  Epoch 0 Step   70 | loss=10.4630 | total=236.1ms (dl=0.3 h2d=9.0 fwd=63.7 bwd=142.5 opt=20.5ms)
+  Epoch 0 Step   80 | loss=10.5774 | total=167.3ms (dl=0.7 h2d=2.8 fwd=68.5 bwd=82.7 opt=12.7ms)
+  Epoch 0 Step   90 | loss=10.4147 | total=174.2ms (dl=0.7 h2d=3.1 fwd=63.7 bwd=94.2 opt=12.5ms)
+  Epoch 0 Step  100 | loss=10.2927 | total=190.9ms (dl=0.3 h2d=2.7 fwd=87.4 bwd=88.9 opt=11.5ms)
+  Epoch 0 Step  110 | loss=10.0816 | total=192.5ms (dl=0.3 h2d=3.0 fwd=70.6 bwd=106.3 opt=12.2ms)
+  Epoch 0 Step  120 | loss=10.2069 | total=166.5ms (dl=0.4 h2d=2.5 fwd=59.6 bwd=94.0 opt=9.9ms)
+
+======================================================================
+BENCHMARK RESULTS (WITH AUGMENTATION)
+======================================================================
+  Mode:             DDP (8 GPUs)
+  Batch per GPU:    8
+  Effective batch:  64 (×3 = 192)
+  Workers/GPU:      8
+  Augmentation:     True
+  Total steps:      120
+
+  [Detailed Timing - Rank 0]
+  Phase                     mean    median      std       min       max   %total
+  -------------------------------------------------------------------
+  Total step              229.1ms    196.3ms   224.1ms    138.9ms   2556.6ms   100.0%
+  DataLoader               10.6ms      0.4ms   105.2ms      0.2ms   1153.7ms     4.6%
+  CPU→GPU (H2D)             3.2ms      2.6ms     1.7ms      2.4ms     12.5ms     1.4%
+  Forward+Loss             74.3ms     70.2ms    19.8ms     48.8ms    195.3ms    32.4%
+  Backward                124.2ms    103.9ms   112.9ms     67.2ms   1173.5ms    54.2%
+  Optimizer                16.9ms     13.2ms    22.4ms      7.6ms    253.4ms     7.4%
+
+  [Throughput]
+    Global (unique samples):    279.3 samples/sec
+    Per GPU (unique samples):   34.9 samples/sec
+    GPU sees (with aug 3x):     838.0 effective samples/sec
+    Steps/sec:                  4.36
+
+  [Time Breakdown]
+    DataLoader             4.6%  ##
+    CPU→GPU (H2D)          1.4%  
+    Forward+Loss          32.4%  ################
+    Backward              54.2%  ###########################
+    Optimizer              7.4%  ###
+
+  [GPU Memory (Rank 0)]
+    Allocated: 1.16 GB
+    Reserved:  1.66 GB
+

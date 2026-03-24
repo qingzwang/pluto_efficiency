@@ -11,6 +11,7 @@
 | `benchmark_generate_data.py` | 生成模拟 `.pt` 数据文件到磁盘 |
 | `benchmark_training_e2e.py` | **端到端**测试：磁盘 I/O → DataLoader → CPU→GPU → 计算 → 更新参数 |
 | `benchmark_gpu_utilization.py` | 监控训练过程中每张 GPU 的 SM 利用率并绘图 |
+| `benchmark_nuplan_sim.py` | 模拟 nuplan CPU 预处理管线，评估数据处理瓶颈 |
 
 ## 测试原理
 
@@ -458,6 +459,67 @@ torchrun --nproc_per_node=8 benchmark_training_ddp.py --batch-size 32
 > - `gpu_utilization_timeline.png` - 时间线（SM%、显存带宽%、功耗）
 > - `gpu_utilization_summary.png` - 柱状图（平均 SM% 和显存带宽%）
 
+### 八、模拟 nuplan 数据管线的 CPU 预处理开销
+
+使用 `benchmark_nuplan_sim.py` 测试。该脚本模拟真实 nuplan 训练中 `PlutoFeatureBuilder.get_features_from_scenario()` 的 CPU 密集操作，无需下载 nuplan 数据集。
+
+#### 模拟的 CPU 操作
+
+| 操作 | 模拟耗时/sample | 真实估计/sample | 说明 |
+|------|:--------------:|:--------------:|------|
+| Map 查询 + 插值 | ~30 ms | 100-500 ms | 150 个多边形 × 3 边界 × 20 点插值 |
+| Cost Map 生成 | ~28 ms | 100-300 ms | cv2.fillPoly + scipy distance_transform_edt (500×500) |
+| 因果推理 | ~3 ms | 20-100 ms | shapely 几何交叉检测 |
+| 参考线计算 | ~2 ms | 20-50 ms | LineString 投影 |
+| Agent 追踪 | ~0.3 ms | 20-50 ms | 跨时间步匹配 + 排序 |
+| 坐标归一化 | ~0.4 ms | 10-50 ms | numpy matmul 旋转变换 |
+| **合计** | **~63 ms** | **~300-1000 ms** | 模拟值为下界，真实值含 DB 查询 |
+
+> **注意**：模拟值仅包含数值计算部分，不包含真实 nuplan 的数据库查询（scenario.get_ego_past_trajectory 等）。真实 feature extraction 耗时通常是模拟值的 **3-10 倍**。
+
+#### 8 卡 DDP + CPU 模拟预处理（per-GPU bs=32）
+
+| Workers/GPU | 总步耗时 | DataLoader | CPU→GPU | Forward | Backward | Optimizer | 全局吞吐量 | DL 占比 |
+|:-----------:|:-------:|:----------:|:-------:|:-------:|:--------:|:---------:|:---------:|:-------:|
+| 4 | 528.7 ms | 299.5 ms | 3.2 ms | 56.8 ms | 159.1 ms | 10.1 ms | 484 samples/s | 56.6% |
+| 8 | 308.5 ms | 118.7 ms | 3.3 ms | 56.5 ms | 121.3 ms | 8.8 ms | 830 samples/s | 38.5% |
+| 16 | 280.9 ms | 78.6 ms | 3.2 ms | 57.3 ms | 132.3 ms | 9.5 ms | 911 samples/s | 28.0% |
+| **无模拟** | **145.8 ms** | **5.3 ms** | **1.2 ms** | **54.9 ms** | **76.8 ms** | **7.6 ms** | **1755 samples/s** | **3.6%** |
+
+> 表中步耗时为 mean 值。DataLoader 列包含 CPU 预处理时间。
+
+#### nuplan 默认配置（per-GPU bs=2, 8 workers）
+
+| 配置 | 总步耗时 | DataLoader | Forward | Backward | 全局吞吐量 | DL 占比 |
+|:----:|:-------:|:----------:|:-------:|:--------:|:---------:|:-------:|
+| bs=2, 8 workers | 105.4 ms | 4.2 ms | 34.1 ms | 58.2 ms | 152 samples/s | 4.0% |
+
+#### CPU 预处理瓶颈分析
+
+1. **小 batch size（bs=2, nuplan 默认）：CPU 不是瓶颈**
+   - 8 workers × 63ms/sample → 理论 ~127 samples/sec
+   - bs=2 时每步只需 2 个 sample/worker → workers 有足够时间预取
+   - DataLoader 仅占 4%，GPU 计算是绝对主导
+
+2. **大 batch size（bs=32）：CPU 成为瓶颈**
+   - 8 workers 时 DataLoader 占 38.5%，明显拖慢训练
+   - 16 workers 时改善到 28%，但仍有显著开销
+   - 无 CPU 模拟时（纯 .pt 读取），吞吐量为 1755 vs 830 samples/s（2.1 倍差距）
+
+3. **真实 nuplan 的情况会更严重**
+   - 模拟的 63ms/sample 只是真实耗时的下界
+   - 真实 nuplan feature extraction 约 300-1000ms/sample（含 DB 查询、复杂 shapely 操作）
+   - bs=32 + 8 workers：需要 32 samples × 300ms / 8 workers = **1200ms**，远超 GPU 计算时间
+
+4. **推荐策略**
+
+   | 场景 | 推荐方案 |
+   |------|---------|
+   | 快速迭代（小 bs） | nuplan 默认 bs=2, 8 workers，CPU 不是瓶颈 |
+   | 最大吞吐量（大 bs） | **使用 feature cache**：先运行 `cache` 操作预计算特征，训练时直接读 cache |
+   | 无 nuplan 数据 | 使用 `benchmark_generate_data.py` 生成模拟数据 + `benchmark_training_e2e.py` |
+   | 评估 CPU 开销 | `benchmark_nuplan_sim.py --num-workers N` 调整 worker 数量 |
+
 ---
 
 ## 已知限制
@@ -497,6 +559,26 @@ for w in 0 2 4 8; do
   torchrun --nproc_per_node=8 benchmark_training_e2e.py \
     --data-dir /tmp/pluto_bench_data --batch-size 32 --num-workers $w
 done
+```
+
+### 模拟 nuplan CPU 预处理瓶颈
+
+```bash
+# 8 卡 DDP，模拟 CPU 预处理，不同 worker 数量
+for w in 4 8 16; do
+  echo "=== ${w} workers ==="
+  torchrun --nproc_per_node=8 benchmark_nuplan_sim.py \
+    --batch-size 32 --num-workers $w --num-samples 10000
+done
+
+# 对比：无 CPU 模拟（纯 .pt 读取基准线）
+torchrun --nproc_per_node=8 benchmark_nuplan_sim.py \
+  --batch-size 32 --num-workers 8 --no-simulate-cpu \
+  --data-dir /tmp/pluto_bench_data_20k
+
+# nuplan 默认配置测试 (bs=2)
+torchrun --nproc_per_node=8 benchmark_nuplan_sim.py \
+  --batch-size 2 --num-workers 8
 ```
 
 ### 对比不同模型规模

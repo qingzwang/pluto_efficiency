@@ -870,7 +870,66 @@ Pluto 训练配置（`train_pluto.yaml`）**始终启用** `ContrastiveScenarioG
 
 4. **无增强模式下 4w 略优于 2w**：bs=32 吞吐 1430 vs 1372（+4%），bs=64 吞吐 1541 vs 1521（+1%）。无增强数据量小，worker 竞争弱，更多 worker 有一定帮助。
 
-**最终结论**：在增强模式下，**`num_workers=2, pin_memory=False` 是三组测试中的最佳配置**。它在大 batch（bs≥32）下将 Backward 方差从默认的 17~33x 降至 7~10x，同时维持吞吐量基本不变（±5%）。增加到 4 workers 反而因 OS 级资源竞争导致方差和吞吐量双双恶化。
+**小结**：在增强模式下，`num_workers=4, pin_memory=False` 因 OS 级资源竞争导致方差和吞吐量双双恶化。
+
+#### 优化验证：num_workers=4 + pin_memory=True
+
+测试保留 pin_memory 但减少 worker 数到 4 的效果（8 × L40S DDP, 10 步 warmup, 1~3 epochs）。
+
+**有增强（ContrastiveScenarioGenerator）**：
+
+| Per-GPU BS | GPU batch | 步耗时 (median) | DataLoader | H2D | Forward | Backward | Optimizer | Bwd max/min | 全局吞吐量 | 显存/卡 |
+|:----------:|:---------:|:--------------:|:----------:|:---:|:-------:|:--------:|:---------:|:-----------:|:---------:|:------:|
+| 8 | 3×8=24 | 205 ms | 0.4 ms (5%) | 3 ms | 78 ms | 103 ms | 11 ms | 11.7x | 273 samples/s | 1.16 GB |
+| 16 | 3×16=48 | 376 ms | 0.6 ms (11%) | 5 ms | 141 ms | 169 ms | 18 ms | 19.0x | 298 samples/s | 2.20 GB |
+| 32 | 3×32=96 | 640 ms | 0.5 ms (18%) | 10 ms | 172 ms | 276 ms | 17 ms | 34.3x | 268 samples/s | 4.30 GB |
+| 64 | 3×64=192 | 548 ms | 0.2 ms (32%) | 19 ms | 182 ms | 337 ms | 9 ms | 27.7x | 260 samples/s | 8.48 GB |
+
+**无增强**：
+
+| Per-GPU BS | GPU batch | 步耗时 (median) | DataLoader | H2D | Forward | Backward | Optimizer | Bwd max/min | 全局吞吐量 | 显存/卡 |
+|:----------:|:---------:|:--------------:|:----------:|:---:|:-------:|:--------:|:---------:|:-----------:|:---------:|:------:|
+| 8 | 8 | 102 ms | 0.3 ms (1%) | 1 ms | 34 ms | 54 ms | 12 ms | 8.0x | 550 samples/s | 0.44 GB |
+| 16 | 16 | 112 ms | 0.3 ms (4%) | 2 ms | 48 ms | 53 ms | 8 ms | 1.9x | 1101 samples/s | 0.79 GB |
+| 32 | 32 | 141 ms | 0.2 ms (11%) | 3 ms | 52 ms | 73 ms | 8 ms | 3.3x | 1589 samples/s | 1.50 GB |
+| 64 | 64 | 195 ms | 0.1 ms (29%) | 6 ms | 75 ms | 107 ms | 8 ms | 1.8x | 1789 samples/s | 2.92 GB |
+
+**分析**：
+
+1. **DataLoader 极快**（pin_memory 的优势）：median 仅 0.1~0.6 ms，数据供给完全不是瓶颈。H2D 传输也很快（1~19 ms）。
+
+2. **但 Backward 方差依然很高**：bs=32 达 34.3x，bs=64 达 27.7x，与默认 8w+pin=True 的 33x/17x 相当。pin_memory_thread 的 DMA 传输与 NCCL AllReduce 的 PCIe 竞争问题在 4 workers 下依然严重。
+
+3. **无增强模式下是最优配置**：DataLoader 几乎零等待，吞吐量全面领先（bs=16: 1101, bs=32: 1589, bs=64: 1789 samples/s），因为无增强 GPU batch 小，pin_memory 竞争弱。
+
+#### 四组配置总结对比
+
+**增强模式**（核心关注 Backward 方差和吞吐量）：
+
+| Per-GPU BS | 指标 | 8w pin=True (默认) | 2w pin=False | 4w pin=False | 4w pin=True |
+|:----------:|:----:|:-----------------:|:-----------:|:-----------:|:-----------:|
+| 8 | Bwd max/min | 2.0x | 5.1x | 16.6x | 11.7x |
+| 8 | 吞吐量 | 279 samples/s | 265 samples/s | 267 samples/s | 273 samples/s |
+| 16 | Bwd max/min | 4.1x | 4.5x | 11.5x | 19.0x |
+| 16 | 吞吐量 | 274 samples/s | **309 samples/s** | 299 samples/s | 298 samples/s |
+| 32 | Bwd max/min | **33x** | **7.2x** | 32.9x | 34.3x |
+| 32 | 吞吐量 | 292 samples/s | 289 samples/s | 260 samples/s | 268 samples/s |
+| 64 | Bwd max/min | **17x** | **9.5x** | 24.6x | 27.7x |
+| 64 | 吞吐量 | 298 samples/s | 288 samples/s | 244 samples/s | 260 samples/s |
+
+**无增强模式**（核心关注吞吐量）：
+
+| Per-GPU BS | 8w pin=True (默认) | 2w pin=False | 4w pin=False | 4w pin=True |
+|:----------:|:-----------------:|:-----------:|:-----------:|:-----------:|
+| 8 | 547 samples/s | 565 samples/s | 570 samples/s | 550 samples/s |
+| 16 | 972 samples/s | 983 samples/s | 948 samples/s | **1101 samples/s** |
+| 32 | **1580 samples/s** | 1372 samples/s | 1430 samples/s | 1589 samples/s |
+| 64 | **2171 samples/s** | 1521 samples/s | 1541 samples/s | 1789 samples/s |
+
+**最终结论**：
+
+- **有增强训练**：推荐 **`num_workers=2, pin_memory=False`**。这是唯一能有效控制 Backward 方差的配置（bs=32: 7.2x vs 其余三组 33~34x），吞吐量损失很小（<5%）。关闭 pin_memory 消除了 pin_memory_thread 与 NCCL AllReduce 的 PCIe 竞争，而减少到 2 workers 则降低了 OS 级共享内存/页面竞争。
+- **无增强训练**：推荐 **`num_workers=4, pin_memory=True`** 或保持默认 **`num_workers=8, pin_memory=True`**。无增强时 GPU batch 小、pin_memory 竞争弱，pin_memory 带来的 DataLoader 加速（median <1ms）和 H2D 加速是净收益。
 
 ---
 

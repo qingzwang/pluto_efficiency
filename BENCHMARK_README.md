@@ -704,12 +704,48 @@ Pluto 训练配置（`train_pluto.yaml`）**始终启用** `ContrastiveScenarioG
 
 - **CUDA 内存分配器**：Test 5 每步对 bs=96 全新分配 tensor，方差仅 1.0x → **不是分配器的问题**
 - **Python GC 导致极端 spike**：Test 4 关闭 GC 后极端 spike 仍在（bwd max 4020ms）→ **GC 不是 spike 原因**
+- **Agent dropout（变长 tensor）**：使用 `diag_dropout.py` 验证，关闭 agent dropout 后方差反而更高（20.8x vs 13.0x）→ **不是 agent dropout 的问题**
 
-**确认的两个叠加因素**：
+**根因定位：多 Worker DataLoader + pin_memory 干扰 CUDA**
 
-1. **Python GC 拖慢 median（~1.55x 开销）**
+使用 `diag_dataloader_path.py` 进行了 5 组精确对照实验，逐步隔离 DataLoader 路径各环节：
 
-   对比 Test 3 vs Test 4（开 gc vs 关 gc），median 变化：
+| 测试 | 描述 | Step median | Bwd max/min | Step max/min |
+|:---:|------|:---:|:---:|:---:|
+| 1 | 纯 GPU bs=96（baseline） | 257 ms | **1.2x** | 1.1x |
+| 2 | DataLoader bs=96 固定 shape，**8 workers** | 283 ms | **2.2x** | **6.3x** |
+| 3 | DataLoader bs=96 固定 shape，**0 workers** | 501 ms | **1.8x** | 1.3x |
+| 4 | DataLoader bs=32 增强，**8 workers** | 459 ms | **26.4x** | **12.6x** |
+| 5 | DataLoader bs=32 增强，**0 workers** | 1210 ms | **3.9x** | 1.3x |
+
+**关键对照**：
+
+1. **Test 2 vs Test 1**：即使是固定 shape 的 tensor，经过 8 worker DataLoader 路径后方差就从 1.2x 升到 2.2x（bwd），step 出现 1622ms spike（6.3x）。说明 **多 worker DataLoader 本身就会引入 CUDA 干扰**。
+
+2. **Test 3 vs Test 2**：0 workers 时 bwd 方差降至 1.8x，step 方差降至 1.3x。step 总时间更长（501ms vs 283ms，因数据在主进程同步生成），但 **方差大幅减小**。
+
+3. **Test 4 vs Test 5**：增强数据 + 8 workers 方差 26.4x vs 0 workers 仅 3.9x。这是最直接的证据：**同样的数据，有无 worker 进程决定了方差是否爆炸**。
+
+4. **Test 5 vs Test 3**：0 workers 下，增强数据（3.9x）仍比固定 shape（1.8x）方差高一些，说明变长 pad_sequence 有少量贡献，但不是主因。
+
+**机制分析**：
+
+多 Worker DataLoader（`num_workers>0`）启动独立子进程，通过共享内存传递数据。当 `pin_memory=True` 时，PyTorch 额外启动一个 `pin_memory_thread` 将数据从 worker 输出队列拷贝到 page-locked（pinned）内存。这个过程会：
+
+- **竞争 PCIe 带宽**：pin_memory_thread 的 DMA 传输与 CUDA kernel 的 GPU↔CPU 通信争用 PCIe 通道
+- **触发页面锁定开销**：大量变长 tensor 的 pin 操作导致 OS 频繁分配/释放 pinned page
+- **与 NCCL AllReduce 冲突**：DDP 梯度同步期间的 NCCL 通信与 pin_memory DMA 传输在 PCIe 上产生竞争
+- **增强数据放大效应**：变长 tensor（pad_sequence）使 pinned buffer 无法复用，每步都需要新分配 pinned memory，放大了上述竞争
+
+**确认的叠加因素**：
+
+1. **多 Worker DataLoader + pin_memory 干扰 CUDA（主因，贡献 ~90% 的方差）**
+
+   8 workers + pin_memory 使 bwd 方差从 3.9x → 26.4x，是极端 spike 的主要来源。
+
+2. **Python GC 拖慢 median（~1.55x 开销）**
+
+   对比 gc.disable() 实验，median 变化：
 
    | Phase | 默认 (gc on) | gc.disable() | 加速比 |
    |:-----:|:-----------:|:------------:|:------:|
@@ -719,18 +755,17 @@ Pluto 训练配置（`train_pluto.yaml`）**始终启用** `ContrastiveScenarioG
 
    增强模式下每步有 3×32=96 份大 dict（含 numpy array + torch tensor）被创建并销毁。Python 的循环引用 GC 周期性扫描这些大量临时对象，开销显著。
 
-2. **变长 pad_sequence 导致 CUDA tensor shape 每步变化 → 极端 spike**
+3. **变长 pad_sequence 有少量贡献（次因）**
 
-   增强模式下 positive sample 做 agent dropout（50% 概率移除非交互 agent），导致 96 个 sample 的 agent 维度不一致。`pad_sequence` 每步 padding 到不同的 max length。当 tensor shape 变化时，PyTorch CUDA caching allocator 无法重用之前 cache 的 memory block，需要 split/merge/compact，偶发触发大规模内存整理（表现为单步 4000ms+ spike）。
-
-   对照证据：Test 5 同样是 bs=96 且每步新分配，但 shape 固定（20 agents），方差仅 1.0x。
+   0 workers 下增强数据方差 3.9x vs 固定 shape 1.8x，说明变长 tensor 对 CUDA allocator 有一定影响，但远不及多 worker 的贡献。
 
 **优化建议**：
 
 | 优化方向 | 预期收益 | 实现复杂度 |
 |---------|:-------:|:---------:|
+| **减少 `num_workers`**（如 2~4）或关闭 `pin_memory` | 大幅减少极端 spike，方差降至 ~2x | 低 |
 | **训练循环中 `gc.disable()`**（周期性手动 `gc.collect()`） | median 快 **1.55x**，立竿见影 | 低 |
-| **固定 pad 长度**（不用 `pad_sequence`，统一 pad 到 max_agents） | 消除极端 spike，方差降到 ~1.2x | 低 |
+| **固定 pad 长度**（不用 `pad_sequence`，统一 pad 到 max_agents） | 进一步减少方差 | 低 |
 | **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`** | 减少 allocator 碎片化 | 低 |
 | **减小 cost map 分辨率**（600→300） | warpAffine 快 4x，节省 ~2.5ms/sample | 低 |
 | **GPU 上做 warpAffine**（用 `kornia` 或 `grid_sample`） | warpAffine+crop 共省 ~3.5ms/sample | 中 |

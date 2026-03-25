@@ -772,6 +772,106 @@ Pluto 训练配置（`train_pluto.yaml`）**始终启用** `ContrastiveScenarioG
 | **预计算增强后的 cache**（离线增强） | 省 ~7ms/sample CPU，但存储增 3x | 中 |
 | **去掉 gzip 压缩**（用 pickle 或 torch.save） | 读取快 ~3x，但存储增 | 低 |
 
+#### 优化验证：num_workers=2 + pin_memory=False
+
+针对上述第一条优化建议，实际测试了 `num_workers=2, pin_memory=False` 的效果（8 × L40S DDP, 10 步 warmup, 1~3 epochs）。
+
+**有增强（ContrastiveScenarioGenerator）**：
+
+| Per-GPU BS | GPU batch | 步耗时 (median) | DataLoader | H2D | Forward | Backward | Optimizer | Bwd max/min | 全局吞吐量 | 显存/卡 |
+|:----------:|:---------:|:--------------:|:----------:|:---:|:-------:|:--------:|:---------:|:-----------:|:---------:|:------:|
+| 8 | 3×8=24 | 232 ms | 28 ms (15%) | 7 ms | 73 ms | 103 ms | 8 ms | 5.1x | 265 samples/s | 1.16 GB |
+| 16 | 3×16=48 | 386 ms | 62 ms (24%) | 21 ms | 112 ms | 151 ms | 8 ms | 4.5x | 309 samples/s | 2.20 GB |
+| 32 | 3×32=96 | 736 ms | 110 ms (27%) | 32 ms | 164 ms | 258 ms | 9 ms | 7.2x | 289 samples/s | 4.30 GB |
+| 64 | 3×64=192 | 873 ms | 130 ms (25%) | 43 ms | 202 ms | 447 ms | 12 ms | 9.5x | 288 samples/s | 8.48 GB |
+
+**无增强**：
+
+| Per-GPU BS | GPU batch | 步耗时 (median) | DataLoader | H2D | Forward | Backward | Optimizer | Bwd max/min | 全局吞吐量 | 显存/卡 |
+|:----------:|:---------:|:--------------:|:----------:|:---:|:-------:|:--------:|:---------:|:-----------:|:---------:|:------:|
+| 8 | 8 | 107 ms | 12 ms (12%) | 2 ms | 36 ms | 46 ms | 9 ms | 4.8x | 565 samples/s | 0.44 GB |
+| 16 | 16 | 133 ms | 22 ms (18%) | 4 ms | 39 ms | 61 ms | 8 ms | 1.9x | 983 samples/s | 0.79 GB |
+| 32 | 32 | 171 ms | 23 ms (20%) | 8 ms | 55 ms | 75 ms | 9 ms | 1.9x | 1372 samples/s | 1.50 GB |
+| 64 | 64 | 264 ms | 68 ms (41%) | 16 ms | 76 ms | 105 ms | 7 ms | 1.2x | 1521 samples/s | 2.92 GB |
+
+**与默认配置（8 workers + pin_memory=True）的对比**：
+
+| Per-GPU BS | 增强 | 指标 | 旧 (8w, pin=True) | 新 (2w, pin=False) | 变化 |
+|:----------:|:----:|:----:|:-----------------:|:-----------------:|:----:|
+| 8 | 有 | Bwd max/min | 2.0x | 5.1x | 变差 |
+| 8 | 有 | 吞吐量 | 279 samples/s | 265 samples/s | -5% |
+| 16 | 有 | Bwd max/min | 4.1x | 4.5x | 持平 |
+| 16 | 有 | 吞吐量 | 274 samples/s | 309 samples/s | **+13%** |
+| 32 | 有 | Bwd max/min | **33x** | **7.2x** | **大幅改善** |
+| 32 | 有 | 吞吐量 | 292 samples/s | 289 samples/s | -1% |
+| 64 | 有 | Bwd max/min | **17x** | **9.5x** | **明显改善** |
+| 64 | 有 | 吞吐量 | 298 samples/s | 288 samples/s | -3% |
+| 32 | 无 | Bwd max/min | — | 1.9x | — |
+| 32 | 无 | 吞吐量 | 1580 samples/s | 1372 samples/s | -13% |
+| 64 | 无 | Bwd max/min | — | 1.2x | — |
+| 64 | 无 | 吞吐量 | 2171 samples/s | 1521 samples/s | -30% |
+
+**分析**：
+
+1. **大 batch + 增强模式下 Backward 方差大幅改善**：bs=32 从 33x 降至 7.2x，bs=64 从 17x 降至 9.5x。关闭 pin_memory 消除了 pin_memory_thread 与 NCCL AllReduce 的 PCIe 竞争，极端 spike 显著减少。
+
+2. **增强模式吞吐量基本持平**（±5%）：增强模式下 GPU 计算（Forward+Backward）是绝对主导（>75%），DataLoader 从 <2% 升至 15~27% 但尚未完全卡住吞吐量。bs=16 增强反而提升 13%，因为减少了极端 spike 对 mean 的拖累。
+
+3. **无增强模式吞吐量明显下降**（-13% ~ -30%）：无增强时 GPU 计算快（bs=32 仅 130ms），2 workers 供给不足成为新瓶颈。bs=64 时 DataLoader 占 41%，严重拖慢训练。
+
+4. **小 batch (bs=8) 增强模式方差反而变差**（2.0x → 5.1x）：2 workers 供给不稳定，偶发等待导致训练节奏不均匀。
+
+5. **H2D 传输变慢但可接受**：关闭 pin_memory 后 H2D 从 ~3ms 升至 7~43ms（随 batch 增大），但相比 Forward+Backward 的数百毫秒仍是小头。
+
+**结论**：`num_workers=2, pin_memory=False` 对增强模式下的大 batch（bs≥32）有明显的稳定性收益（方差降低 2~5 倍），但对无增强模式会引入 DataLoader 瓶颈。
+
+#### 优化验证：num_workers=4 + pin_memory=False
+
+进一步测试增加 worker 数到 4 是否能缓解 DataLoader 供给不足（8 × L40S DDP, 10 步 warmup, 1~3 epochs）。
+
+**有增强（ContrastiveScenarioGenerator）**：
+
+| Per-GPU BS | GPU batch | 步耗时 (median) | DataLoader | H2D | Forward | Backward | Optimizer | Bwd max/min | 全局吞吐量 | 显存/卡 |
+|:----------:|:---------:|:--------------:|:----------:|:---:|:-------:|:--------:|:---------:|:-----------:|:---------:|:------:|
+| 8 | 3×8=24 | 217 ms | 24 ms (13%) | 6 ms | 65 ms | 105 ms | 9 ms | 16.6x | 267 samples/s | 1.16 GB |
+| 16 | 3×16=48 | 380 ms | 45 ms (26%) | 15 ms | 99 ms | 171 ms | 11 ms | 11.5x | 299 samples/s | 2.20 GB |
+| 32 | 3×32=96 | 677 ms | 122 ms (24%) | 28 ms | 149 ms | 227 ms | 13 ms | 32.9x | 260 samples/s | 4.30 GB |
+| 64 | 3×64=192 | 666 ms | 125 ms (34%) | 35 ms | 184 ms | 329 ms | 8 ms | 24.6x | 244 samples/s | 8.49 GB |
+
+**无增强**：
+
+| Per-GPU BS | GPU batch | 步耗时 (median) | DataLoader | H2D | Forward | Backward | Optimizer | Bwd max/min | 全局吞吐量 | 显存/卡 |
+|:----------:|:---------:|:--------------:|:----------:|:---:|:-------:|:--------:|:---------:|:-----------:|:---------:|:------:|
+| 8 | 8 | 106 ms | 12 ms (12%) | 2 ms | 34 ms | 50 ms | 8 ms | 3.2x | 570 samples/s | 0.44 GB |
+| 16 | 16 | 127 ms | 13 ms (13%) | 3 ms | 37 ms | 66 ms | 6 ms | 2.9x | 948 samples/s | 0.79 GB |
+| 32 | 32 | 160 ms | 23 ms (22%) | 6 ms | 51 ms | 72 ms | 7 ms | 1.6x | 1430 samples/s | 1.50 GB |
+| 64 | 64 | 252 ms | 42 ms (35%) | 14 ms | 78 ms | 106 ms | 9 ms | 2.4x | 1541 samples/s | 2.92 GB |
+
+**三组配置完整对比（增强模式）**：
+
+| Per-GPU BS | 指标 | 8w pin=True (默认) | 2w pin=False | 4w pin=False |
+|:----------:|:----:|:-----------------:|:-----------:|:-----------:|
+| 8 | Bwd max/min | 2.0x | 5.1x | 16.6x |
+| 8 | 吞吐量 | 279 samples/s | 265 samples/s | 267 samples/s |
+| 16 | Bwd max/min | 4.1x | 4.5x | 11.5x |
+| 16 | 吞吐量 | 274 samples/s | **309 samples/s** | 299 samples/s |
+| 32 | Bwd max/min | **33x** | **7.2x** | **32.9x** |
+| 32 | 吞吐量 | 292 samples/s | 289 samples/s | 260 samples/s |
+| 64 | Bwd max/min | **17x** | **9.5x** | **24.6x** |
+| 64 | 吞吐量 | 298 samples/s | 288 samples/s | 244 samples/s |
+
+**分析**：
+
+1. **4 workers 时 Backward 方差回升严重**：bs=32 从 2w 的 7.2x 飙回 32.9x（接近默认 8w 的 33x），bs=64 从 9.5x 升到 24.6x。更多 worker 进程意味着更多并发的共享内存传输和页面操作，即使没有 pin_memory，worker 进程与 CUDA 之间的 OS 级别资源竞争（共享内存 mmap、页面缺失、CPU cache 争用）仍然存在。
+
+2. **吞吐量也下降**：bs=32 增强从 289 降至 260（-10%），bs=64 增强从 288 降至 244（-15%）。极端 Backward spike 拉高了 mean 步耗时。
+
+3. **DataLoader 供给并未明显改善**：4w 的 DataLoader 占比（13~34%）与 2w（15~27%）差别不大。说明瓶颈不在 worker 处理速度，而在数据从 worker 传到主进程的通道竞争。
+
+4. **无增强模式下 4w 略优于 2w**：bs=32 吞吐 1430 vs 1372（+4%），bs=64 吞吐 1541 vs 1521（+1%）。无增强数据量小，worker 竞争弱，更多 worker 有一定帮助。
+
+**最终结论**：在增强模式下，**`num_workers=2, pin_memory=False` 是三组测试中的最佳配置**。它在大 batch（bs≥32）下将 Backward 方差从默认的 17~33x 降至 7~10x，同时维持吞吐量基本不变（±5%）。增加到 4 workers 反而因 OS 级资源竞争导致方差和吞吐量双双恶化。
+
 ---
 
 ## 已知限制
